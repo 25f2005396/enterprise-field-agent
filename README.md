@@ -1,41 +1,39 @@
 # Enterprise Field Agent
 
-An AI agent that carries out ERP/CRM tasks through a set of mock REST APIs. You give it a goal in plain English, it decides which tools to call and checks what comes back, and it asks a human for approval before anything is written.
+This is an AI agent that does ERP/CRM tasks through mock REST APIs. You type a goal like "check stock for SKU-992 and remove 5 units for Project Helios", and the agent works out which tools to call, looks at what each call returns, and decides the next step. Before it changes any data it stops and asks a person to approve.
 
-It was built by Neelisetty Venkata Naga Teja for an assignment on tool-calling enterprise agents. The agent loop uses LangGraph, the services use FastAPI, validation is done with Pydantic, data lives in SQLite, and the LLM is served by Groq.
+I built it for an assignment on tool-calling agents. It uses LangGraph for the agent loop, FastAPI for the services, Pydantic for checking tool inputs, SQLite for storage and Groq for the LLM.
 
-## What it does
+## How it works
 
-The agent works in a loop. At each step it writes a short thought, picks a tool, and reads the result before deciding what to do next. The command line prints each step as Thought, Action and Observation so you can follow along.
-
-- It has five tools: inventory lookup, inventory adjustment, lead lookup, lead status update and support ticket creation.
-- Every tool call is checked against a schema. If the model sends bad arguments, for example SKU-99 instead of SKU-992, the error goes back to the model and it tries again.
-- Retries are capped, and a call that already failed is never repeated with the same arguments.
-- Every write stops and waits for a person to approve it. The approval is tied to the exact tool and arguments, it expires after 10 minutes, and the person who started the run cannot approve it.
-- Writes carry an idempotency key, so a retry after a timeout cannot apply the same change twice.
-- The HTTP version adds role-based API keys, a tamper-evident audit log, live event streaming and optional signed webhooks.
-
-Example run:
+Each step the agent writes a short thought, picks a tool and reads the result. The terminal prints these as THOUGHT, ACTION and OBSERVATION, so you can follow what it's doing. A real run looks like this:
 
 ```
 Goal: Check stock for SKU-992 and remove 5 units for Project Helios
 
-Step 1  THOUGHT  Need to verify current stock for SKU-992 before adjusting inventory
+Step 1  THOUGHT  Lookup current stock for SKU-992 before making any adjustment
         ACTION   lookup_inventory({"sku": "SKU-992"})
-        OBSERVATION  {"status": "SUCCESS", "inventory": {"sku": "SKU-992", "stock_level": 42, ...}}
+        OBSERVATION  {"status": "SUCCESS", "inventory": {"sku": "SKU-992", "stock_level": 30, ...}}
 
-Step 2  THOUGHT  Stock is sufficient, so request the adjustment with a reason.
-        ACTION   adjust_inventory({"sku": "SKU-992", "adjustment_units": -5, ...})  (needs approval)
+Step 2  THOUGHT  Remove 5 units from SKU-992 for Project Helios after confirming stock
+        ACTION   adjust_inventory({"sku": "SKU-992", "adjustment_units": -5, ...})  (sensitive write - needs approval)
         Approve this write? [y/n]: y
-        OBSERVATION  {"status": "SUCCESS", "previous_stock": 42, "current_stock": 37, ...}
+        OBSERVATION  {"status": "SUCCESS", "previous_stock": 30, "current_stock": 25, ...}
 
-Step 3  THOUGHT  Goal achieved.
+Step 3  THOUGHT  Goal achieved: stock checked and 5 units removed for Project Helios
 Result: COMPLETED
 ```
 
+A few things I added so it behaves sensibly:
+
+- Every tool call is validated first. If the model sends something wrong (like `SKU-99`), the error goes back to it so it can fix the call and try again.
+- It gives up after a few failed attempts instead of looping forever, and it never repeats a call that already failed.
+- Every write (inventory change, lead update, new ticket) waits for approval. The approval is for that exact call, expires after 10 minutes, and the person who started the run can't be the one who approves it.
+- Writes carry an idempotency key, so a retry after a timeout doesn't apply the same change twice.
+
 ## Setup
 
-You need Python 3.11 or newer (I used 3.14 on Windows) and Git. A Groq API key is only needed for real LLM runs. The demo mode and the tests work without one.
+You need Python 3.11 or newer (I used 3.14 on Windows) and Git. The demo mode and the tests don't need an API key. Real runs need a Groq key.
 
 On Windows (PowerShell):
 
@@ -48,76 +46,46 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-If PowerShell refuses to run the activate script, run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` first.
+If PowerShell won't run the activate script, run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` first. On macOS or Linux it's `python3 -m venv .venv`, `source .venv/bin/activate` and `cp .env.example .env`.
 
-On macOS or Linux, use `python3 -m venv .venv`, `source .venv/bin/activate` and `cp .env.example .env` instead.
+Then open `.env`. The app won't start while any value still says `replace_with...`, so replace each of those with a random string. This prints one:
 
-Next, fill in the secrets in `.env`. The app refuses to start while any of them is a placeholder. On Windows this replaces all seven at once:
-
-```powershell
-$c = Get-Content .env -Raw
-$c = [regex]::Replace($c, '(?m)^(AGENT_SECURITY_SECRET|WEBHOOK_SIGNING_SECRET|ERP_INTERNAL_API_KEY|ADMIN_API_KEY|OPERATOR_API_KEY|APPROVER_API_KEY|AUDITOR_API_KEY)=.*$', { param($m) $m.Groups[1].Value + '=' + (python -c "import secrets; print(secrets.token_urlsafe(48))") })
-[System.IO.File]::WriteAllText("$PWD\.env", $c, (New-Object System.Text.UTF8Encoding($false)))
+```
+python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-On other systems, generate each value with `python3 -c "import secrets; print(secrets.token_urlsafe(48))"` and paste it in by hand. Keep `.env` private. It is already in `.gitignore`.
+The role keys (admin, operator, approver, auditor) must all be different, and each needs at least 24 characters. Put your Groq key in `GROQ_API_KEY`. `.env` is in `.gitignore`, so don't commit it.
 
-## Configuration
-
-Everything is set in `.env`. The settings you will actually touch:
-
-- `GROQ_API_KEY`: your Groq key. Leave the placeholder for demo mode and tests.
-- `LLM_MODEL`: the model to use. It must be one your key can access (see below).
-- `AGENT_SECURITY_SECRET`, `WEBHOOK_SIGNING_SECRET`: random strings, at least 32 characters.
-- `ERP_INTERNAL_API_KEY`: key the agent uses to call the mock ERP service, at least 24 characters.
-- `ADMIN_API_KEY`, `OPERATOR_API_KEY`, `APPROVER_API_KEY`, `AUDITOR_API_KEY`: one key per role, at least 24 characters each and all different.
-- `DB_PATH`: SQLite file, `erp_crm_enterprise.db` by default.
-- `MAX_PLAN_STEPS`, `MAX_RETRIES`, `APPROVAL_TTL_SECONDS`: loop limits and approval lifetime (8, 3 and 600 by default).
-
-Groq changes its model list from time to time, and the model named in `.env.example` may not be available to you. If a run fails with `model_not_found`, list what your key can use:
-
-```powershell
-$k = ((Get-Content .env | Where-Object { $_ -match '^GROQ_API_KEY=' }) -replace '^GROQ_API_KEY=','').Trim()
-(Invoke-RestMethod https://api.groq.com/openai/v1/models -Headers @{Authorization="Bearer $k"}).data.id | Sort-Object
-```
-
-Pick a chat model (skip the whisper, tts and guard ones) and put it in `.env`, for example `LLM_MODEL=openai/gpt-oss-120b`.
+The model in `.env.example` (`llama-3.3-70b-versatile`) gave me a `model_not_found` error, so I set `LLM_MODEL=openai/gpt-oss-120b` in my `.env` and that worked. Groq changes its models now and then. You can see what your key can use by sending a GET request to `https://api.groq.com/openai/v1/models` with your key as a bearer token.
 
 ## Running it
 
-The agent calls the mock ERP service, so start that first in its own terminal and leave it running:
+Start the mock ERP service in one terminal and leave it running:
 
 ```
 python -m api.mock_erp_crm
 ```
 
-Then, in a second terminal with the virtual environment active:
+In a second terminal:
 
 ```
 python main.py --demo
 python main.py "Check stock for SKU-992 and remove 5 units for Project Helios"
-python main.py
 ```
 
-The first command is an offline demo with a scripted planner, so no LLM key is needed. It sends a bad SKU on purpose to show the agent correcting itself. Add `--yes` to auto-approve the write. The second command runs a real goal through the LLM, and the third starts an interactive prompt.
+`--demo` uses a scripted planner instead of the LLM, so it works without a key. It sends a wrong SKU on purpose to show the agent correcting itself, and `--yes` approves the write automatically. The second command uses the real LLM. Running `python main.py` with no goal gives you an interactive prompt.
 
-When a write is proposed, the program shows the exact tool and arguments and asks for approval. Answer `n` and the run is aborted with nothing written.
+When the agent wants to write something it shows the tool and arguments and asks `Approve this write? [y/n]`. If you answer `n`, nothing is written.
 
-To reset the sample data, stop the ERP service and delete `erp_crm_enterprise.db`.
+The sample data starts with three products (SKU-992 with 42 units, SKU-104 with 5 and SKU-550 with 150), two leads (LEAD-401, LEAD-402) and one customer (CUST-001). Every approved run changes the stock, so to reset it, stop the ERP service and delete `erp_crm_enterprise.db`.
 
-## Tools and sample data
+## Tools
 
-- `lookup_inventory`: stock level, warehouse zone and price for a SKU.
-- `adjust_inventory`: change stock by a non-zero number, with a reason. Needs approval.
-- `lookup_lead`: company, status and deal value for a lead.
-- `update_lead_status`: move a lead to NEW, CONTACTED, QUALIFIED, UNQUALIFIED, CLOSED_WON or CLOSED_LOST. Needs approval.
-- `create_support_ticket`: open a ticket with priority LOW, MEDIUM, HIGH or CRITICAL. Needs approval.
+The agent has five tools: `lookup_inventory`, `adjust_inventory`, `lookup_lead`, `update_lead_status` and `create_support_ticket`. The three that change data need approval.
 
-The mock database starts with three SKUs (SKU-992 with 42 units, SKU-104 with 5, SKU-550 with 150), two leads (LEAD-401 and LEAD-402) and one customer (CUST-001).
+## HTTP version
 
-## HTTP gateway
-
-To use the REST version instead of the command line, run `python server.py`. It listens on port 8000 and the interactive docs are at `/docs`. An operator starts a run with `POST /api/v1/agent/run`, an approver finds it with `GET /api/v1/approvals/pending` and approves it with `POST /api/v1/agent/approve`, and anyone with access can read the trace from `GET /api/v1/agent/sessions/{id}`. There are also endpoints for rejecting, reconciling an interrupted write, streaming events, and reading and verifying the audit log. Send the role key in an `X-API-Key` header.
+There's also a REST version of the agent. Run `python server.py` and open `http://127.0.0.1:8000/docs`. An operator starts a run, a different user with the approver role approves or rejects it, and each user sends their own key in an `X-API-Key` header. It also has an audit log and a live event stream. I mostly used the terminal version, so the CLI is the better one to try first.
 
 ## Tests
 
@@ -125,19 +93,19 @@ To use the REST version instead of the command line, run `python server.py`. It 
 pytest -q
 ```
 
-There are 84 tests. They use a temporary database and a scripted planner, so they need no network and no API key. They cover approvals, access control, idempotent writes, recovery of interrupted writes, retry limits, the audit log, webhooks and streaming.
+There are 84 tests. They use a temporary database and a fake planner, so they don't need the network or an API key.
 
-## Troubleshooting
+## Problems I ran into
 
-- `Python was not found` on Windows: use `py` instead of `python`, or install Python with the "Add to PATH" box ticked.
-- `ERP service not reachable`: the mock service is not running. Start `python -m api.mock_erp_crm` in another terminal.
+- `Python was not found` on Windows: use `py` instead of `python`.
+- `ERP service not reachable`: start `python -m api.mock_erp_crm` first.
+- `Errno 10048` when starting the ERP service: it's already running in another terminal.
 - `401 Invalid API Key`: the Groq key in `.env` is missing or wrong.
-- `404 model_not_found`: pick a model your key can use, as described under Configuration.
-- Startup stops with `FATAL CONFIGURATION ERROR`: a secret in `.env` is missing, too short or still a placeholder.
+- `404 model_not_found`: change `LLM_MODEL` to a model your key can use.
 
 ## Limitations
 
-This is a prototype. SQLite is fine for one machine but not for several servers, the role keys are demo credentials, and the ERP and CRM services are simulated. Before exposing it beyond localhost it would need TLS, key rotation, rate limiting and a real identity provider. The quality of the plans also depends on the LLM you choose.
+It's a prototype. SQLite is fine on one machine but not for several servers, the ERP and CRM services are fake, and the API keys in `.env` are demo credentials. Before anyone used it for real it would need HTTPS, proper login and rate limiting. How good the plans are also depends on the model.
 
 ## Author
 
